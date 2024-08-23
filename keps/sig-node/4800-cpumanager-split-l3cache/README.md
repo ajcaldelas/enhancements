@@ -58,7 +58,7 @@ If none of those approvers are still appropriate, then changes to that list
 should be approved by the remaining approvers and/or the owning SIG (or
 SIG Architecture for cross-cutting KEPs).
 -->
-# KEP-NNNN: Your short, descriptive title
+# KEP-4800: Enhance CPU Manager with L3 Cache Aware
 
 <!--
 This is the title of your KEP. Keep it short, simple, and descriptive. A good
@@ -154,6 +154,7 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
+We proposed this KEP to introduce a new CPU Manager static policy option that groups CPU resources by last level cache where possible (reference pr-101432). The opt-in feature changes the cpu assignment algorithm to add sorting by L3 cache and then taking cpus aligned to the same L3 cache, where possible.  In cases where numbers of cpu requested exceeds number of cpus grouped in the same L3 cache, the algorithm attempts best-effort to reduce assignments of cpus across minimal numbers of L3s. If the cpumanager can’t align optimally, it will still admit the workload as before.  More details will be given in the motivation section.
 <!--
 This section is incredibly important for producing high-quality, user-focused
 documentation such as release notes or a development roadmap. It should be
@@ -174,7 +175,10 @@ updates.
 -->
 
 ## Motivation
+Our motivation is the same as in the following design doc CPUManager: cache and die affinity - Google Docs.  The enhancement is to reduce noisy neighbor scenarios that occur on systems with split L3 cache, which is available on both x86 and ARM architecture.
+The challenge with current kubelet’s cpu manager is that it is unaware of split L3 architecture and spreads CPU assignments across distributed L3s. This creates a noisy neighbor problem where multiple pods/containers are sharing the same L3 cache. In addition, pods spread against multiple L3 cache sees higher latency and reduced performance due to inter-cache access latency. For workload use cases that are sensitive to latency and are performance deterministic, minimizing the noisy neighbor condition in L3 can have significant improvements in performance.
 
+The figure below highlights performance gain when pod placement is aligned to an L3 group. In this exampleTPCC/My-SQL  is the workload deployed. There was a 18% uplift compared to default behavior.  Other workloads might see  higher gains.  For Stream workload, highlighted in the original design doc, the performance uplift was approximately 20%.
 <!--
 This section is for explicitly listing the motivation, goals, and non-goals of
 this KEP.  Describe why the change is important and the benefits to users. The
@@ -186,12 +190,18 @@ demonstrate the interest in a KEP within the wider Kubernetes community.
 
 ### Goals
 
+- Introduce a new CPU Manager policy option that assigns CPU within the same grouping of L3 cache to pods and container scope.  
+- Minimize the number of CPUs assignments from different L3 grouping to pods and container scope.
+- Cross-die could also decrease performance.  Add support for multiple socket systems.
+
 <!--
 List the specific goals of the KEP. What is it trying to achieve? How will we
 know that this has succeeded?
 -->
 
 ### Non-Goals
+
+This proposal does not aim to modify CPU assignments for CPU Manager policy set to none.  This does not alter the behavior of existing static policy options such as full-pcpus-only.
 
 <!--
 What is out of scope for this KEP? Listing non-goals helps to focus discussion
@@ -200,6 +210,10 @@ and make progress.
 
 ## Proposal
 
+- Add a new static policy option for fine tuning of CPU assignments to align L3 cache grouping.
+- Topology struct already contains CPUDetails which is a map of CPUInfo.  CPUInfo knows about NUMA, socket, and core IDs associated with a CPU.  We just need to add a new member called L3GroupID that tracks whether the CPU is part of a split L3. Functionality to support this was merged in cadvisor with these pull-requests pr-2849  pr-2847
+- Handle enablement of the policy option in pkg/kubelet/cm/cpumanager/policy_options.go and check the validity of the user flag and capability of the system.  If topology does not support split L3, grouping by L3 static policy will be ignored.  
+- Modify the static policy “Allocate” to check for the option, GroupByL3. For platforms where SMT is enabled, full-pcpus-only policy option will be preserved on top of group-by-l3-cache.
 <!--
 This is where we get down to the specifics of what the proposal actually is.
 This should have enough detail that reviewers can understand exactly what
@@ -233,6 +247,9 @@ This might be a good place to talk about core concepts and how they relate.
 
 ### Risks and Mitigations
 
+- Feature is enabled by a static policy option flag.  
+- It does not change behavior of non-static policy
+- It preserves the behavior of other static options.
 <!--
 What are the risks of this proposal, and how do we mitigate? Think broadly.
 For example, consider both security and how this will impact the larger
@@ -246,6 +263,94 @@ Consider including folks who also work outside the SIG or subproject.
 -->
 
 ## Design Details
+
+- Add `L3GroupID` in `CPUInfo` `topology.go`
+  
+  ```go
+  type CPUInfo struct {
+    NUMANodeID int
+    SocketID   int
+    CoreID     int
+    L3GroupID  int
+  }
+  ```
+  
+- Assign with L3GroupID from `core.UncoreCaches[0].Id` obtained from cadvisorapi.
+
+  ```go
+  func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
+  CPUDetails[cpu] = CPUInfo{
+    CoreID:     coreID,
+    SocketID:   core.SocketID,
+    NUMANodeID: node.Id,
+    L3GroupID:  core.UncoreCaches[0].Id
+    }
+  }
+    ```
+
+- User configuration defined in kubelet config
+
+  ```yaml
+  kind: KubeletConfiguration
+  cpuManagerPolicy: static
+  cpuManagerPolicyOptions:
+  group-by-l3-preferred: true
+  ```
+
+- Define new policy option in `pkg/kubelet/cm/cpumanager/policy_options.go`
+
+  ```go
+  const GroupByL3CacheOption string = "group-by-l3-preferred"   type StaticPolicyOptions struct {
+  …
+  GroupByL3CacheOption bool;
+  func ValidateStaticPolicyOptions …{
+  if(GroupByL3CacheOption) {
+     if topology.CPUDetails.CPUInfo.GroupByL3ID //check if system has L3  
+    }
+  …
+  }
+  ```
+
+- Enforce full_pcpus_only policy in Allocate if GroupByL3 is enabled.
+
+  ```go
+  func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
+  …
+  // if p.options.GroupByL3 {
+  //	p.option.FullPhysicalCPUsOnly  = true
+  //}
+  …
+  }
+
+  ```
+
+- In static_policy takeByTopology, check for option GroupByL3 and implement new cpu_assignment to TakeByL3
+  
+  ```go
+  func (p *staticPolicy) takeByTopology(availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+  ...
+  acc.numaOrSocketsFirst.takeFullFirstLevel()
+  if acc.isSatisfied() {
+    return acc.result, nil
+  }
+  acc.numaOrSocketsFirst.takeFullSecondLevel()
+  if acc.isSatisfied() {
+    return acc.result, nil
+  }
+  if cpuSortingStrategy != CPUSortingStrategySpread {
+    // if (p.option.GroupByL3){
+    //	acc.NumaorSocket.takeFullThirdLevel ...
+    //}
+    acc.takeFullCores()
+    if acc.isSatisfied() {
+      return acc.result, nil
+      }
+  }
+  ...
+  }
+  ```
+
+
 
 <!--
 This section should contain enough information that the specifics of your
