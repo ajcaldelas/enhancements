@@ -58,7 +58,7 @@ If none of those approvers are still appropriate, then changes to that list
 should be approved by the remaining approvers and/or the owning SIG (or
 SIG Architecture for cross-cutting KEPs).
 -->
-# KEP-4800: Enhance CPU Manager with L3 Cache Aware
+# KEP-4800: Enhancement Split L3 Cache Topology Awareness in CPU Manager
 
 <!--
 This is the title of your KEP. Keep it short, simple, and descriptive. A good
@@ -154,7 +154,7 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-We proposed this KEP to introduce a new CPU Manager static policy option that groups CPU resources by last level cache where possible (reference pr-101432). The opt-in feature changes the cpu assignment algorithm to add sorting by L3 cache and then taking cpus aligned to the same L3 cache, where possible.  In cases where numbers of cpu requested exceeds number of cpus grouped in the same L3 cache, the algorithm attempts best-effort to reduce assignments of cpus across minimal numbers of L3s. If the cpumanager can’t align optimally, it will still admit the workload as before.  More details will be given in the motivation section.
+We proposed this KEP to introduce a new CPU Manager static policy option, "align-cpus-by-uncorecache", that groups CPU resources by last level cache where possible [kubernetes/pr-6750](https://github.com/kubernetes/kubernetes/pull/126750). The opt-in feature changes the cpu assignment algorithm to add sorting by L3 cache and then taking cpus aligned to the same L3 cache, where possible.  In cases where numbers of cpu requested exceeds number of cpus grouped in the same L3 cache, the algorithm attempts best-effort to reduce assignments of cpus across minimal numbers of L3s. If the cpumanager can’t align optimally, it will still admit the workload as before.  More details will be given in the motivation section.
 <!--
 This section is incredibly important for producing high-quality, user-focused
 documentation such as release notes or a development roadmap. It should be
@@ -175,7 +175,7 @@ updates.
 -->
 
 ## Motivation
-Our motivation is the same as in the following design doc CPUManager: cache and die affinity - Google Docs.  The enhancement is to reduce noisy neighbor scenarios that occur on systems with split L3 cache, which is available on both x86 and ARM architecture.
+Our motivation is to reduce noisy neighbor scenarios that occur on systems with split L3 cache, which is available on both x86 and ARM architecture.
 The challenge with current kubelet’s cpu manager is that it is unaware of split L3 architecture and spreads CPU assignments across distributed L3s. This creates a noisy neighbor problem where multiple pods/containers are sharing the same L3 cache. In addition, pods spread against multiple L3 cache sees higher latency and reduced performance due to inter-cache access latency. For workload use cases that are sensitive to latency and are performance deterministic, minimizing the noisy neighbor condition in L3 can have significant improvements in performance.
 
 The figure below highlights performance gain when pod placement is aligned to an L3 group. In this exampleTPCC/My-SQL  is the workload deployed. There was a 18% uplift compared to default behavior.  Other workloads might see  higher gains.  For Stream workload, highlighted in the original design doc, the performance uplift was approximately 20%.
@@ -190,8 +190,8 @@ demonstrate the interest in a KEP within the wider Kubernetes community.
 
 ### Goals
 
-- Introduce a new CPU Manager policy option that assigns CPU within the same grouping of L3 cache to pods and container scope.  
-- Minimize the number of CPUs assignments from different L3 grouping to pods and container scope.
+- Introduce a new CPU Manager policy option that assigns CPU within the same grouping of uncorecache or L3 cache to pods and container scope.  
+- Minimize the number of CPUs assignments from different uncorecache/L3 grouping to pods and container scope.
 - Cross-die could also decrease performance.  Add support for multiple socket systems.
 
 <!--
@@ -210,10 +210,11 @@ and make progress.
 
 ## Proposal
 
-- Add a new static policy option for fine tuning of CPU assignments to align L3 cache grouping.
-- Topology struct already contains CPUDetails which is a map of CPUInfo.  CPUInfo knows about NUMA, socket, and core IDs associated with a CPU.  We just need to add a new member called L3GroupID that tracks whether the CPU is part of a split L3. Functionality to support this was merged in cadvisor with these pull-requests pr-2849  pr-2847
+- Add a new static policy option to fine-tune CPU assignments to align by uncorecache/L3 cache grouping.
+- Topology struct already contains CPUDetails which is a map of CPUInfo.  CPUInfo knows about NUMA, socket, and core IDs associated with a CPU.  We just need to add a new member called uncorecacheId that tracks whether the CPU is part of a split L3. Functionality to support this was merged in cadvisor with these pull-requests [cadvisor/pr-2849](https://github.com/google/cadvisor/pull/2849) and [cadvisor/pr-2847](https://github.com/google/cadvisor/pull/2847/)
 - Handle enablement of the policy option in pkg/kubelet/cm/cpumanager/policy_options.go and check the validity of the user flag and capability of the system.  If topology does not support split L3, grouping by L3 static policy will be ignored.  
-- Modify the static policy “Allocate” to check for the option, GroupByL3. For platforms where SMT is enabled, full-pcpus-only policy option will be preserved on top of group-by-l3-cache.
+- Modify the "Allocate" static policy to check for the option, align-cpus-by-uncorecache. For platforms where SMT is enabled, align-cpus-by-uncorecache will typically take full cores and also works with the option full-pcpus-only.
+- Align-cpus-by-uncorecache is not compatible with the options DistributeCPUsAcrossNUMAOption and DistributeCPUsAcrossCoresOption.
 <!--
 This is where we get down to the specifics of what the proposal actually is.
 This should have enough detail that reviewers can understand exactly what
@@ -264,18 +265,33 @@ Consider including folks who also work outside the SIG or subproject.
 
 ## Design Details
 
-- Add `L3GroupID` in `CPUInfo` `topology.go`
+- Add `UnCoreCacheID` in `CPUInfo` and modify CPUTopology struct to also track uncorecaches in `topology.go`
   
   ```go
-  type CPUInfo struct {
+  // CPUTopology contains details of node cpu, where :
+  // CPU  - logical CPU, cadvisor - thread
+  // Core - physical CPU, cadvisor - Core
+  // Socket - socket, cadvisor - Socket
+  // NUMA Node - NUMA cell, cadvisor - Node
+  // UnCoreCache - Split L3 Cache Topology, cadvisor
+  type CPUTopology struct {
+  	NumCPUs        int
+  	NumCores       int
+  	NumUnCoreCache int
+  	NumSockets     int
+  	NumNUMANodes   int
+  	CPUDetails     CPUDetails
+  }
+
+    type CPUInfo struct {
     NUMANodeID int
     SocketID   int
     CoreID     int
-    L3GroupID  int
+    UnCoreCacheID  int
   }
   ```
   
-- Assign with L3GroupID from `core.UncoreCaches[0].Id` obtained from cadvisorapi.
+- Get the UnCoreCacheID for each CPU from cadvisor.
 
   ```go
   func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
@@ -283,48 +299,45 @@ Consider including folks who also work outside the SIG or subproject.
     CoreID:     coreID,
     SocketID:   core.SocketID,
     NUMANodeID: node.Id,
-    L3GroupID:  core.UncoreCaches[0].Id
+    UnCoreCacheID:  core.UncoreCaches[0].Id
     }
   }
     ```
 
-- User configuration defined in kubelet config
+- Enabling the cpu manager policy option in kubelet.yaml
 
   ```yaml
   kind: KubeletConfiguration
   cpuManagerPolicy: static
   cpuManagerPolicyOptions:
-  group-by-l3-preferred: true
+  align-cpus-by-uncorecache: true
   ```
 
 - Define new policy option in `pkg/kubelet/cm/cpumanager/policy_options.go`
 
   ```go
-  const GroupByL3CacheOption string = "group-by-l3-preferred"   type StaticPolicyOptions struct {
-  …
-  GroupByL3CacheOption bool;
-  func ValidateStaticPolicyOptions …{
-  if(GroupByL3CacheOption) {
-     if topology.CPUDetails.CPUInfo.GroupByL3ID //check if system has L3  
-    }
-  …
-  }
-  ```
+  // new option const
+  const AlignByUnCoreCacheOption string = "align-cpus-by-uncorecache"   
 
-- Enforce full_pcpus_only policy in Allocate if GroupByL3 is enabled.
-
-  ```go
-  func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
-  …
-  // if p.options.GroupByL3 {
-  //	p.option.FullPhysicalCPUsOnly  = true
-  //}
-  …
+  // Flag that makes best-effort to align CPUs to a L3 or uncorecache boundary
+	// As long as there are CPUs available, pods will be admitted if the condition is not met.
+  type StaticPolicyOptions struct{
+    AlignByUnCoreCacheOption bool
   }
+
+  //NewStaticPolicyOptions, check for compatiblity
+    if opts.AlignByUnCoreCacheOption && opts.DistributeCPUsAcrossCores {
+		return opts, fmt.Errorf("static policy options %s and %s can not be used at the same time", AlignByUnCoreCacheOption, DistributeCPUsAcrossCoresOption)
+	}
 
   ```
 
-- In static_policy takeByTopology, check for option GroupByL3 and implement new cpu_assignment to TakeByL3
+
+- In static_policy.go, check for option AlignByUnCoreCacheOption in takeByTopology. Implement new cpu assignment
+  function that takeByTopologyUncorecachePacked which adds a third level of CPU grouping in the topology.
+  <b>Socket->Numa->UnCoreCache</b>.  
+  TakeByTopologyUnCoreCachePacked uses the "packed" cpu sorting strategy similar to takeByTopologyNUMAPacked.
+
   
   ```go
   func (p *staticPolicy) takeByTopology(availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
@@ -337,20 +350,53 @@ Consider including folks who also work outside the SIG or subproject.
   if acc.isSatisfied() {
     return acc.result, nil
   }
-  if cpuSortingStrategy != CPUSortingStrategySpread {
-    // if (p.option.GroupByL3){
-    //	acc.NumaorSocket.takeFullThirdLevel ...
-    //}
-    acc.takeFullCores()
-    if acc.isSatisfied() {
-      return acc.result, nil
-      }
-  }
-  ...
+	// 2. Acquire partial uncorecache, if there are enough CPUs available to satisfy the container requirement
+	//    Acquire the full uncorecache, if available and the container requires at least all the CPUs in the uncorecache grouping
+	acc.numaOrSocketsFirst.takeThirdLevel()
+	if acc.isSatisfied() {
+		return acc.result, nil
+	}
+    ...
   }
   ```
 
+- Define a new interface in the numaOrSocketsFirstFunc in cpu_assignment.go that implements takeThirdLevel, which calls takeUnCoreCache.
+```go
+// In Split L3 Topology, we take from the sets of uncorecache as the thrid level
+func (n *numaFirst) takeThirdLevel() {
+	n.acc.takeUnCoreCache()
+}
 
+// First try to take partial uncorecache (CCD), if available and the request size can fit w/in the uncorecache.
+// Second try to take the full CCD if available and need is at least the size of the uncorecache group.
+func (a *cpuAccumulator) takeUnCoreCache() {
+	// check if SMT ON
+
+	for _, uncore := range a.allUnCoreCache() {
+		numCoresNeeded := a.numCPUsNeeded / a.topo.CPUsPerCore() //this is another new change
+
+		var freeCPUsInUncorecache cpuset.CPUSet
+		//need to get needed cores in uncorecache
+		freeCoresInUncorecache := a.details.CoresNeededInUnCoreCache(numCoresNeeded, uncore)
+		klog.V(2).Info("free cores from a.details list: ", freeCoresInUncorecache)
+		for _, coreId := range freeCoresInUncorecache.List() {
+			freeCPUsInUncorecache = freeCPUsInUncorecache.Union(a.topo.CPUDetails.CPUsInCores(coreId))
+		}
+		klog.V(2).Info("freeCPUsInUncorecache  : ", freeCPUsInUncorecache)
+		if a.numCPUsNeeded == freeCPUsInUncorecache.Size() {
+			klog.V(4).InfoS("takePartialUncore: claiming cores from Uncorecache ID", uncore)
+			a.take(freeCPUsInUncorecache)
+		}
+		//take full Uncorecache if the numCPUsNeeded is greater the L3 cache size
+		a.takeFullUnCore()
+
+		if a.isSatisfied() {
+			return
+		}
+	}
+}
+
+```
 
 <!--
 This section should contain enough information that the specifics of your
