@@ -396,6 +396,36 @@ func (a *cpuAccumulator) takeUnCoreCache() {
 	}
 }
 
+// CoresNeededInUnCoreCache returns either the full list of all available unique core IDs associated with the given
+// UnCoreCache IDs in this CPUDetails or subset that matches the ask.
+func (d CPUDetails) CoresNeededInUnCoreCache(numCoresNeeded int, ids ...int) cpuset.CPUSet {
+	var coreIDs []int
+	for _, id := range ids {
+		for _, info := range d {
+			if info.UnCoreCacheID == id {
+
+				if !slices.Contains(coreIDs, info.CoreID) {
+					coreIDs = append(coreIDs, info.CoreID)
+				}
+			}
+		}
+	}
+	sort.Ints(coreIDs)
+
+	//return only unique coreID
+	var coresNeeded []int
+
+	if len(coreIDs) > numCoresNeeded {
+		//return only what is needed
+		coresNeeded = coreIDs[0:numCoresNeeded]
+	} else {
+		//return the full list
+		coresNeeded = coreIDs
+	}
+	klog.V(2).Info("Available coreIDs : ", coresNeeded)
+	return cpuset.New(coresNeeded...)
+}
+
 ```
 
 <!--
